@@ -195,7 +195,7 @@ func main() {
 	limiter = make(chan struct{}, *queue)
 
 	vips.SetLogging(func(d string, l vips.LogLevel, m string) {
-		log.Print("%s %v %s", d, l, m)
+		log.Printf("%s %v %s\n", d, l, m)
 	}, vips.LogLevelDebug)
 
 	vips.Startup(&vips.Config{
