@@ -1,17 +1,20 @@
 package main
 
 import (
-	"bytes"
 	"flag"
+	"io"
 	"log"
+	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 
-	"github.com/davidbyttow/govips/v2/vips"
-	"github.com/valyala/fasthttp"
-	"github.com/valyala/fasthttp/reuseport"
+	"github.com/cshum/vipsgen/vips"
 )
+
+func init() {
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+}
 
 var maxwidth int
 var maxheight int
@@ -38,69 +41,56 @@ func parseOptions(s string) map[string]string {
 	return options
 }
 
-func handler(ctx *fasthttp.RequestCtx) {
-	defer func() {
-		log.Println(string(ctx.URI().PathOriginal()))
-	}()
+type WriteNopCloser struct {
+	io.Writer
+}
 
-	path := string(ctx.URI().PathOriginal())
-	if len(ctx.URI().QueryString()) > 0 {
-		path += "?" + string(ctx.URI().QueryString())
+func (w *WriteNopCloser) Write(b []byte) (int, error) {
+	return w.Writer.Write(b)
+}
+
+func (w *WriteNopCloser) Close() error {
+	return nil
+}
+
+var limiter chan struct{}
+
+func handler(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Path
+	if path == "/healthz" {
+		w.WriteHeader(http.StatusAccepted)
+		return
 	}
+
 	parts := strings.SplitN(path, "/", 3)
 
 	path = parts[2]
 
 	u, err := url.Parse(path)
 	if err != nil {
-		log.Print(err)
-		ctx.SetStatusCode(503)
+		log.Print("Parse url", err)
+		w.WriteHeader(503)
 		return
 	}
-
-	req := fasthttp.AcquireRequest()
-	resp := fasthttp.AcquireResponse()
-
-	if u.Scheme == "" {
-		req.SetHostBytes(ctx.Request.Header.Peek(fasthttp.HeaderXForwardedHost))
-		req.URI().SetSchemeBytes(ctx.Request.Header.Peek(fasthttp.HeaderXForwardedProto))
-		req.URI().SetPath(path)
-	} else {
-		req.SetRequestURI(u.String())
-	}
-
-	if err := fasthttp.Do(req, resp); err != nil {
-		log.Print(err)
-	}
-	fasthttp.ReleaseRequest(req)
-
-	img, err := vips.NewImageFromBuffer(resp.Body())
-	fasthttp.ReleaseResponse(resp)
-	if err != nil {
-		log.Print(err)
-		ctx.SetStatusCode(503)
-		return
-	}
-	defer img.Close()
 
 	opts := parseOptions(parts[1])
-	w := maxwidth
-	h := maxheight
+	iw := maxwidth
+	ih := maxheight
 	crop := vips.InterestingNone
 
 	if wv, exist := opts["width"]; exist {
-		if wv == "auto" {
+		if wv == "auto" || wv == "" {
 
 		} else {
-			w, _ = strconv.Atoi(wv)
+			iw, _ = strconv.Atoi(wv)
 		}
 	}
 
 	if hv, exist := opts["height"]; exist {
-		if hv == "auto" {
+		if hv == "auto" || hv == "" {
 
 		} else {
-			h, _ = strconv.Atoi(hv)
+			ih, _ = strconv.Atoi(hv)
 		}
 	}
 
@@ -111,32 +101,69 @@ func handler(ctx *fasthttp.RequestCtx) {
 		}
 	}
 
-	img.ThumbnailWithSize(w, h, crop, vips.SizeDown)
-
-	var params *vips.ExportParams
-
-	if bytes.Contains(ctx.Request.Header.Peek("Accept"), []byte("image/webp")) {
-		params = vips.NewDefaultWEBPExportParams()
-		ctx.SetContentType("image/webp")
-		ctx.Response.Header.Set("Vary", "Accept")
+	var url string
+	if u.Scheme == "" {
+		url = r.Header.Get("X-Forwarded-Proto") + "://" + r.Header.Get("X-Forwarded-Host") + "/" + path
 	} else {
-		switch img.Format() {
-		case vips.ImageTypePNG:
-			params = vips.NewDefaultPNGExportParams()
-			ctx.SetContentType("image/png")
-		default:
-			params = vips.NewDefaultJPEGExportParams()
-			ctx.SetContentType("image/jpeg")
-		}
+		url = path
 	}
-	params.StripMetadata = true
 
-	b, _, err := img.Export(params)
+	limiter <- struct{}{}
+	defer func() { <-limiter }()
+
+	log.Println(opts, url, r.Header.Get("X-Request-ID"))
+
+	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		log.Print(err)
-		ctx.SetStatusCode(503)
+		w.WriteHeader(503)
+		return
 	}
-	ctx.Write(b)
+	req.Header.Set("X-Request-ID", r.Header.Get("X-Request-ID"))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Print(err)
+		w.WriteHeader(503)
+		return
+	}
+	defer resp.Body.Close()
+
+	source := vips.NewSource(resp.Body)
+	defer source.Close()
+
+	img, err := vips.NewThumbnailSource(source, iw, &vips.ThumbnailSourceOptions{
+		Height:   ih,
+		Size:     vips.SizeDown,
+		Crop:     crop,
+		NoRotate: true,
+		FailOn:   vips.FailOnError,
+	})
+	if err != nil {
+		log.Print(err)
+		w.WriteHeader(503)
+		return
+	}
+	defer img.Close()
+
+	target := vips.NewTarget(&WriteNopCloser{w})
+
+	if strings.Contains(r.Header.Get("Accept"), "image/webp") {
+		w.Header().Set("Content-Type", "image/webp")
+		w.Header().Set("Vary", "Accept")
+		w.WriteHeader(http.StatusOK)
+		img.WebpsaveTarget(target, nil)
+	} else {
+		switch img.Format() {
+		case vips.ImageTypePng:
+			w.Header().Set("Content-Type", "image/png")
+			w.WriteHeader(http.StatusOK)
+			img.PngsaveTarget(target, nil)
+		default:
+			w.Header().Set("Content-Type", "image/jpeg")
+			w.WriteHeader(http.StatusOK)
+			img.JpegsaveTarget(target, nil)
+		}
+	}
 }
 
 func main() {
@@ -144,15 +171,16 @@ func main() {
 	flag.IntVar(&maxheight, "max-height", 2160, "")
 	flag.Parse()
 
-	vips.LoggingSettings(nil, vips.LogLevelMessage)
+	limiter = make(chan struct{}, 10)
 
-	vips.Startup(nil)
+	vips.Startup(&vips.Config{
+		MaxCacheFiles:    0,
+		ReportLeaks:      true,
+		ConcurrencyLevel: 8,
+		MaxCacheMem:      0,
+		MaxCacheSize:     0,
+	})
 	defer vips.Shutdown()
 
-	ln, err := reuseport.Listen("tcp4", ":8080")
-	if err != nil {
-		log.Fatalln(err)
-	}
-
-	fasthttp.Serve(ln, handler)
+	http.ListenAndServe(":8080", http.HandlerFunc(handler))
 }
