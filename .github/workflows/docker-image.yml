@@ -20,4 +20,4 @@ jobs:
       with:
         context: .
         push: true
-        tags: vlastv/imly:latest
+        tags: vlastv/imly:latest,vlastv/imly:${{ github.ref_name }}
