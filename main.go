@@ -152,6 +152,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	defer img.Close()
 
 	target := vips.NewTarget(&WriteNopCloser{w})
+	defer target.Close()
 
 	if strings.Contains(r.Header.Get("Accept"), "image/webp") {
 		w.Header().Set("Content-Type", "image/webp")
@@ -192,6 +193,10 @@ func main() {
 	flag.Parse()
 
 	limiter = make(chan struct{}, *queue)
+
+	vips.SetLogging(func(d string, l vips.LogLevel, m string) {
+		log.Print("%s %v %s", d, l, m)
+	}, vips.LogLevelDebug)
 
 	vips.Startup(&vips.Config{
 		MaxCacheFiles: 0,
