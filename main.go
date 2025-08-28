@@ -178,14 +178,16 @@ func handler(w http.ResponseWriter, r *http.Request) {
 func main() {
 	flag.IntVar(&maxwidth, "max-width", 3840, "")
 	flag.IntVar(&maxheight, "max-height", 2160, "")
+	queue := flag.Int("queue", 100, "Requests queue size")
+	concurrency := flag.Int("concurrency", 8, "Libvips concurrency")
 	flag.Parse()
 
-	limiter = make(chan struct{}, 10)
+	limiter = make(chan struct{}, *queue)
 
 	vips.Startup(&vips.Config{
 		MaxCacheFiles:    0,
 		ReportLeaks:      true,
-		ConcurrencyLevel: 8,
+		ConcurrencyLevel: *concurrency,
 		MaxCacheMem:      0,
 		MaxCacheSize:     0,
 	})
