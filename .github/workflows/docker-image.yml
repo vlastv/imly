@@ -1,9 +1,6 @@
 name: Docker Image CI
 
-on:
-  push:
-    tags:
-      - '*'
+on: push
 
 jobs:
   build:
@@ -19,4 +16,4 @@ jobs:
       with:
         context: .
         push: true
-        tags: vlastv/imly:latest,vlastv/imly:${{ github.ref_name#v }}
+        tags: vlastv/imly:latest,vlastv/imly:${{ github.ref_name }#v}
