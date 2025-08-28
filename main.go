@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/cshum/vipsgen/vips"
 )
@@ -56,6 +57,8 @@ func (w *WriteNopCloser) Close() error {
 var limiter chan struct{}
 
 func handler(w http.ResponseWriter, r *http.Request) {
+	handleStart := time.Now()
+
 	path := r.URL.Path
 	if path == "/healthz" {
 		w.WriteHeader(http.StatusAccepted)
@@ -108,10 +111,14 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		url = path
 	}
 
+	waitStart := time.Now()
 	limiter <- struct{}{}
 	defer func() { <-limiter }()
+	waitElalpsed := time.Since(waitStart)
 
-	log.Println(opts, url, r.Header.Get("X-Request-ID"))
+	defer func() {
+		log.Println(opts, url, r.Header.Get("X-Request-ID"), time.Since(handleStart).Seconds(), waitElalpsed.Seconds())
+	}()
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
