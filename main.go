@@ -111,11 +111,6 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		url = path
 	}
 
-	waitStart := time.Now()
-	limiter <- struct{}{}
-	defer func() { <-limiter }()
-	waitElalpsed := time.Since(waitStart)
-
 	downloadStart := time.Now()
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -133,10 +128,12 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 	downloadElapsed := time.Since(downloadStart)
 
-	defer func() {
-		log.Printf("%s %v %s %0.2f %0.2f %0.2f", url, opts, r.Header.Get("X-Request-ID"), time.Since(handleStart).Seconds(), waitElalpsed.Seconds(), downloadElapsed.Seconds())
-	}()
+	waitStart := time.Now()
+	limiter <- struct{}{}
+	defer func() { <-limiter }()
+	waitElalpsed := time.Since(waitStart)
 
+	processStart := time.Now()
 	source := vips.NewSource(resp.Body)
 	defer source.Close()
 
@@ -173,23 +170,34 @@ func handler(w http.ResponseWriter, r *http.Request) {
 			img.JpegsaveTarget(target, nil)
 		}
 	}
+
+	defer func() {
+		log.Printf(
+			"%s %v %s handle=%0.2fs wait=%0.2fs download=%0.2fs thumbnail=%0.2fs",
+			url,
+			opts,
+			r.Header.Get("X-Request-ID"),
+			time.Since(handleStart).Seconds(),
+			waitElalpsed.Seconds(),
+			downloadElapsed.Seconds(),
+			time.Since(processStart).Seconds(),
+		)
+	}()
 }
 
 func main() {
 	flag.IntVar(&maxwidth, "max-width", 3840, "")
 	flag.IntVar(&maxheight, "max-height", 2160, "")
 	queue := flag.Int("queue", 100, "Requests queue size")
-	concurrency := flag.Int("concurrency", 8, "Libvips concurrency")
 	flag.Parse()
 
 	limiter = make(chan struct{}, *queue)
 
 	vips.Startup(&vips.Config{
-		MaxCacheFiles:    0,
-		ReportLeaks:      true,
-		ConcurrencyLevel: *concurrency,
-		MaxCacheMem:      0,
-		MaxCacheSize:     0,
+		MaxCacheFiles: 0,
+		ReportLeaks:   true,
+		MaxCacheMem:   0,
+		MaxCacheSize:  0,
 	})
 	defer vips.Shutdown()
 
