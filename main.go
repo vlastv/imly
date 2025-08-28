@@ -116,10 +116,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	defer func() { <-limiter }()
 	waitElalpsed := time.Since(waitStart)
 
-	defer func() {
-		log.Println(opts, url, r.Header.Get("X-Request-ID"), time.Since(handleStart).Seconds(), waitElalpsed.Seconds())
-	}()
-
+	downloadStart := time.Now()
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		log.Print(err)
@@ -134,6 +131,11 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
+	downloadElapsed := time.Since(downloadStart)
+
+	defer func() {
+		log.Printf("%s %v %s %0.2f %0.2f %0.2f", url, opts, r.Header.Get("X-Request-ID"), time.Since(handleStart).Seconds(), waitElalpsed.Seconds(), downloadElapsed.Seconds())
+	}()
 
 	source := vips.NewSource(resp.Body)
 	defer source.Close()
