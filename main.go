@@ -54,8 +54,6 @@ func (w *WriteNopCloser) Close() error {
 	return nil
 }
 
-var limiter chan struct{}
-
 func handler(w http.ResponseWriter, r *http.Request) {
 	handleStart := time.Now()
 
@@ -128,11 +126,6 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 	downloadElapsed := time.Since(downloadStart)
 
-	waitStart := time.Now()
-	limiter <- struct{}{}
-	defer func() { <-limiter }()
-	waitElalpsed := time.Since(waitStart)
-
 	processStart := time.Now()
 	source := vips.NewSource(resp.Body)
 	defer source.Close()
@@ -143,6 +136,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		Crop:     crop,
 		NoRotate: true,
 		FailOn:   vips.FailOnError,
+		Intent:   vips.IntentRelative,
 	})
 	if err != nil {
 		log.Print(err)
@@ -174,12 +168,11 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 	defer func() {
 		log.Printf(
-			"%s %v %s handle=%0.2fs wait=%0.2fs download=%0.2fs thumbnail=%0.2fs",
+			"%s %v %s handle=%0.2fs download=%0.2fs thumbnail=%0.2fs",
 			url,
 			opts,
 			r.Header.Get("X-Request-ID"),
 			time.Since(handleStart).Seconds(),
-			waitElalpsed.Seconds(),
 			downloadElapsed.Seconds(),
 			time.Since(processStart).Seconds(),
 		)
@@ -189,14 +182,11 @@ func handler(w http.ResponseWriter, r *http.Request) {
 func main() {
 	flag.IntVar(&maxwidth, "max-width", 3840, "")
 	flag.IntVar(&maxheight, "max-height", 2160, "")
-	queue := flag.Int("queue", 100, "Requests queue size")
 	flag.Parse()
-
-	limiter = make(chan struct{}, *queue)
 
 	vips.SetLogging(func(d string, l vips.LogLevel, m string) {
 		log.Printf("%s %v %s\n", d, l, m)
-	}, vips.LogLevelDebug)
+	}, vips.LogLevelMessage)
 
 	vips.Startup(&vips.Config{
 		MaxCacheFiles: 0,
