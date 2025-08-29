@@ -1,24 +1,23 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"io"
 	"log"
 	"net/http"
-	"net/url"
+	"os/signal"
 	"strconv"
 	"strings"
-	"time"
+	"syscall"
 
+	"github.com/cshum/imagor"
+	"github.com/cshum/imagor/imagorpath"
+	"github.com/cshum/imagor/loader/httploader"
+	"github.com/cshum/imagor/processor/vipsprocessor"
 	"github.com/cshum/vipsgen/vips"
 )
-
-func init() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
-}
-
-var maxwidth int
-var maxheight int
 
 func normalizeOption(o string) string {
 	switch o {
@@ -42,48 +41,89 @@ func parseOptions(s string) map[string]string {
 	return options
 }
 
-type WriteNopCloser struct {
-	io.Writer
+func handleOk(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	return
 }
 
-func (w *WriteNopCloser) Write(b []byte) (int, error) {
-	return w.Writer.Write(b)
+func isNoopRequest(r *http.Request) bool {
+	return r.Method == http.MethodGet && (r.URL.Path == "/healthcheck" || r.URL.Path == "/favicon.ico")
 }
 
-func (w *WriteNopCloser) Close() error {
+func noopHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isNoopRequest(r) {
+			handleOk(w, r)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func writeBody(w http.ResponseWriter, r *http.Request, reader io.ReadCloser, size int64) {
+	defer func() {
+		_ = reader.Close()
+	}()
+	if size > 0 {
+		// total size known, use io.Copy
+		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+		if r.Method != http.MethodHead {
+			_, _ = io.Copy(w, reader)
+		}
+	} else {
+		// total size unknown, read all
+		buf, _ := io.ReadAll(reader)
+		w.Header().Set("Content-Length", strconv.Itoa(len(buf)))
+		if r.Method != http.MethodHead {
+			_, _ = w.Write(buf)
+		}
+	}
+}
+
+type Service struct {
+	app *imagor.Imagor
+}
+
+func (s *Service) Startup(ctx context.Context) error {
+	vips.Startup(&vips.Config{
+		MaxCacheFiles:    0,
+		MaxCacheMem:      0,
+		MaxCacheSize:     0,
+		ConcurrencyLevel: 1,
+	})
+
 	return nil
 }
 
-func handler(w http.ResponseWriter, r *http.Request) {
-	handleStart := time.Now()
+func (s *Service) Shutdown(ctx context.Context) error {
+	vips.Shutdown()
 
-	path := r.URL.Path
-	if path == "/healthz" {
-		w.WriteHeader(http.StatusAccepted)
+	return nil
+}
+
+func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
 
-	parts := strings.SplitN(path, "/", 3)
-
-	path = parts[2]
-
-	u, err := url.Parse(path)
-	if err != nil {
-		log.Print("Parse url", err)
-		w.WriteHeader(503)
-		return
-	}
+	parts := strings.SplitN(r.URL.Path, "/", 3)
 
 	opts := parseOptions(parts[1])
-	iw := maxwidth
-	ih := maxheight
-	crop := vips.InterestingNone
+	path := parts[2]
+
+	p := imagorpath.Params{
+		Unsafe: true,
+		Path:   r.URL.Path,
+		Image:  path,
+	}
 
 	if wv, exist := opts["width"]; exist {
 		if wv == "auto" || wv == "" {
 
 		} else {
-			iw, _ = strconv.Atoi(wv)
+			iw, _ := strconv.Atoi(wv)
+			p.Width = iw
 		}
 	}
 
@@ -91,110 +131,86 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		if hv == "auto" || hv == "" {
 
 		} else {
-			ih, _ = strconv.Atoi(hv)
+			ih, _ := strconv.Atoi(hv)
+			p.Height = ih
 		}
 	}
 
 	if fit, exist := opts["fit"]; exist {
 		switch fit {
 		case "crop":
-			crop = vips.InterestingCentre
+
 		}
-	}
-
-	var url string
-	if u.Scheme == "" {
-		url = r.Header.Get("X-Forwarded-Proto") + "://" + r.Header.Get("X-Forwarded-Host") + "/" + path
 	} else {
-		url = path
+		p.FitIn = true
 	}
 
-	downloadStart := time.Now()
-	req, err := http.NewRequest("GET", url, nil)
+	blob, err := s.app.Do(r, p)
+
 	if err != nil {
-		log.Print(err)
-		w.WriteHeader(503)
-		return
-	}
-	req.Header.Set("X-Request-ID", r.Header.Get("X-Request-ID"))
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		log.Print(err)
-		w.WriteHeader(503)
-		return
-	}
-	defer resp.Body.Close()
-	downloadElapsed := time.Since(downloadStart)
-
-	processStart := time.Now()
-	source := vips.NewSource(resp.Body)
-	defer source.Close()
-
-	img, err := vips.NewThumbnailSource(source, iw, &vips.ThumbnailSourceOptions{
-		Height:   ih,
-		Size:     vips.SizeDown,
-		Crop:     crop,
-		NoRotate: true,
-		FailOn:   vips.FailOnError,
-		Intent:   vips.IntentRelative,
-	})
-	if err != nil {
-		log.Print(err)
-		w.WriteHeader(503)
-		return
-	}
-	defer img.Close()
-
-	target := vips.NewTarget(&WriteNopCloser{w})
-	defer target.Close()
-
-	if strings.Contains(r.Header.Get("Accept"), "image/webp") {
-		w.Header().Set("Content-Type", "image/webp")
-		w.Header().Set("Vary", "Accept")
-		w.WriteHeader(http.StatusOK)
-		img.WebpsaveTarget(target, nil)
-	} else {
-		switch img.Format() {
-		case vips.ImageTypePng:
-			w.Header().Set("Content-Type", "image/png")
-			w.WriteHeader(http.StatusOK)
-			img.PngsaveTarget(target, nil)
-		default:
-			w.Header().Set("Content-Type", "image/jpeg")
-			w.WriteHeader(http.StatusOK)
-			img.JpegsaveTarget(target, nil)
+		if errors.Is(err, context.Canceled) {
+			w.WriteHeader(499)
+			return
 		}
+
+		w.WriteHeader(503)
+		return
 	}
 
-	defer func() {
-		log.Printf(
-			"%s %v %s handle=%0.2fs download=%0.2fs thumbnail=%0.2fs",
-			url,
-			opts,
-			r.Header.Get("X-Request-ID"),
-			time.Since(handleStart).Seconds(),
-			downloadElapsed.Seconds(),
-			time.Since(processStart).Seconds(),
-		)
-	}()
+	w.Header().Set("Content-Type", blob.ContentType())
+
+	reader, size, _ := blob.NewReader()
+	writeBody(w, r, reader, size)
+}
+
+type options struct {
+	baseUrl   string
+	maxWidth  int
+	maxHeight int
 }
 
 func main() {
-	flag.IntVar(&maxwidth, "max-width", 3840, "")
-	flag.IntVar(&maxheight, "max-height", 2160, "")
+	opts := options{}
+	flag.StringVar(&opts.baseUrl, "base-url", "", "")
+	flag.IntVar(&opts.maxWidth, "max-width", 3840, "Max width")
+	flag.IntVar(&opts.maxHeight, "max-height", 2160, "Max height")
 	flag.Parse()
+	ctx, cancel := signal.NotifyContext(
+		context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
 
-	vips.SetLogging(func(d string, l vips.LogLevel, m string) {
-		log.Printf("%s %v %s\n", d, l, m)
-	}, vips.LogLevelMessage)
+	svc := &Service{
+		app: imagor.New(
+			imagor.WithUnsafe(true),
+			imagor.WithDebug(true),
+			imagor.WithLoaders(
+				httploader.New(
+					httploader.WithBaseURL(opts.baseUrl),
+				),
+			),
+			imagor.WithProcessors(
+				vipsprocessor.NewProcessor(
+					vipsprocessor.WithMaxWidth(opts.maxWidth),
+					vipsprocessor.WithMaxHeight(opts.maxHeight),
+				),
+			),
+		),
+	}
+	svc.Startup(ctx)
+	defer svc.Shutdown(ctx)
 
-	vips.Startup(&vips.Config{
-		MaxCacheFiles: 0,
-		ReportLeaks:   true,
-		MaxCacheMem:   0,
-		MaxCacheSize:  0,
-	})
-	defer vips.Shutdown()
+	srv := &http.Server{
+		Addr:    ":8000",
+		Handler: noopHandler(svc),
+	}
 
-	http.ListenAndServe(":8080", http.HandlerFunc(handler))
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatal(err)
+		}
+
+		log.Println("Listen on " + srv.Addr)
+	}()
+
+	<-ctx.Done()
 }
